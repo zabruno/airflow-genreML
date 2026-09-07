@@ -1,0 +1,24 @@
+# Conexiones, pools y variables para el entorno LOCAL de desarrollo.
+# Astro CLI las carga solas al hacer `astro dev start`, así que no hay que
+# darlas de alta a mano desde la interfaz.
+#
+# Este archivo NO se versiona (está en .gitignore) justamente porque acá es
+# donde irían contraseñas y tokens. La conexión de la PokéAPI no tiene ningún
+# secreto -- es una API abierta -- pero se declara igual porque HttpOperator
+# está diseñado para recibir un `http_conn_id` con la URL base.
+
+airflow:
+  connections:
+
+    - conn_id: hugging_face
+      conn_type: http
+      conn_host: datasets-server.huggingface.co
+      conn_schema: https
+
+  pools:
+    - pool_name:
+      pool_slot:
+      pool_description:
+  variables:
+    - variable_name:
+      variable_value:
