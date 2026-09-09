@@ -14,6 +14,20 @@ DAG arranca desde la API Parquet del Hub:
 `https://huggingface.co/api/datasets/maharshipandya/spotify-tracks-dataset/parquet/default/train`.
 
 
+Validaciones principales:
+
+* existencia de `track_id` y `track_genre`;
+* presencia de las caracteristicas de audio esperadas;
+* `track_id` unico en Plata;
+* mas de 1.000 filas;
+* al menos 5 columnas utiles;
+* mezcla de tipos y reporte de `dtypes`;
+* nulos por columna y por feature;
+* ninguna columna completamente vacia;
+* cantidad y distribucion de generos;
+* columnas faltantes o inesperadas respecto del esquema esperado.
+
+
 """
 from __future__ import annotations
 
@@ -88,6 +102,10 @@ FLOAT_COLUMNS = [
     "tempo",
 ]
 
+MIN_ROWS = 1_000
+MIN_COLUMNS = 5
+
+
 def _http_json(url: str) -> Any:
     request = Request(url, headers={"User-Agent": "GenreML-Airflow/1.0"})
     with urlopen(request, timeout=60) as response:
@@ -130,6 +148,9 @@ def _bronze_manifest_path(resolved_revision: str) -> Path:
 def _silver_dataset_path(resolved_revision: str) -> Path:
     return SILVER_DIR / f"revision={resolved_revision}" / "genreML_tracks.csv"
 
+
+def _safe_ratio(series):
+    return series.fillna(0).sort_values(ascending=False)
 
 
 @dag(
@@ -439,11 +460,111 @@ def genreML_hf_ingest():
             "excluded_bronze_columns": excluded_bronze_columns,
         }
 
+    @task
+    def validate_silver(silver_stats: dict) -> dict:
+        """Valida la calidad del dataset Plata.
+
+        Entrada: ruta del CSV Plata y estadisticas de Bronce/transformacion.
+        Salida: las mismas rutas con un resumen de validacion.
+        Separacion: falla explicitamente ante problemas criticos antes de
+        publicar el entregable.
+        """
+        import pandas as pd
+
+        silver_path = silver_stats["silver_path"]
+        df = pd.read_csv(silver_path, low_memory=False)
+        problems = []
+
+        missing_columns = [column for column in PROJECT_COLUMNS if column not in df.columns]
+        missing_audio = [column for column in AUDIO_FEATURES if column not in df.columns]
+        unexpected_columns = sorted(set(df.columns) - set(PROJECT_COLUMNS))
+        duplicate_final = int(df["track_id"].duplicated().sum()) if "track_id" in df else None
+        fully_empty_columns = df.columns[df.isna().all()].tolist()
+        null_ratio = _safe_ratio(df.isna().mean())
+        null_count = df.isna().sum().sort_values(ascending=False)
+        dtype_counts = df.dtypes.value_counts()
+        genre_counts = df["track_genre"].value_counts(dropna=False) if "track_genre" in df else None
+        feature_nulls = (
+            pd.DataFrame({
+                "null_count": df[AUDIO_FEATURES].isna().sum(),
+                "null_ratio": df[AUDIO_FEATURES].isna().mean(),
+            })
+            if not missing_audio
+            else None
+        )
+
+        if "track_id" not in df.columns:
+            problems.append("falta la columna critica track_id")
+        elif not df["track_id"].is_unique:
+            problems.append(f"track_id no es unico: {duplicate_final} duplicados finales")
+        if "track_genre" not in df.columns:
+            problems.append("falta la columna critica track_genre")
+        elif df["track_genre"].isna().any():
+            problems.append(f"track_genre tiene {int(df['track_genre'].isna().sum())} nulos")
+        if missing_audio:
+            problems.append(f"faltan features de audio esperadas: {missing_audio}")
+        if len(df) <= MIN_ROWS:
+            problems.append(f"volumen insuficiente: {len(df)} filas, minimo requerido > {MIN_ROWS}")
+        if df.shape[1] < MIN_COLUMNS:
+            problems.append(
+                f"ancho insuficiente: {df.shape[1]} columnas, minimo requerido {MIN_COLUMNS}"
+            )
+        if fully_empty_columns:
+            problems.append(f"columnas completamente vacias: {fully_empty_columns}")
+        if unexpected_columns:
+            problems.append(f"columnas inesperadas en Plata: {unexpected_columns}")
+
+        numeric_columns = df.select_dtypes(include=["number"]).columns.tolist()
+        categorical_columns = df.select_dtypes(include=["object", "string", "bool"]).columns.tolist()
+        if not numeric_columns:
+            problems.append("no se detectaron columnas numericas en Plata")
+        if not categorical_columns:
+            problems.append("no se detectaron columnas categoricas o booleanas en Plata")
+
+        log.info("Dataset Bronce: %s filas", silver_stats.get("raw_rows"))
+        log.info("Dataset Plata: %s filas x %s columnas", df.shape[0], df.shape[1])
+        log.info(
+            "Duplicados por track_id detectados antes de deduplicar: %s",
+            silver_stats.get("duplicate_track_ids_before_dedup"),
+        )
+        log.info("Duplicados eliminados: %s", silver_stats.get("duplicates_removed"))
+        log.info("track_id unico: %s", "OK" if "track_id" in df and df["track_id"].is_unique else "ERROR")
+        if genre_counts is not None:
+            log.info("Generos encontrados: %s", int(df["track_genre"].nunique(dropna=True)))
+            log.info("Distribucion de track_genre:\n%s", genre_counts.to_string())
+        log.info("df.shape: %s", df.shape)
+        log.info("df.dtypes.value_counts():\n%s", dtype_counts.to_string())
+        log.info("Columnas con nulos:\n%s", null_count[null_count > 0].to_string())
+        log.info("Porcentaje de nulos:\n%s", (null_ratio[null_ratio > 0] * 100).to_string())
+        if feature_nulls is not None:
+            log.info("Nulos por feature de audio:\n%s", feature_nulls.to_string())
+        log.info("Columnas completamente vacias: %s", fully_empty_columns)
+        log.info("Columnas faltantes respecto del esquema esperado: %s", missing_columns)
+        log.info("Columnas inesperadas en Plata: %s", unexpected_columns)
+        log.info("Rutas Bronce utilizadas: %s", silver_stats["bronze_paths"])
+        log.info("Ruta CSV Plata producido: %s", silver_path)
+
+        if problems:
+            raise ValueError("Validacion final fallida:\n  - " + "\n  - ".join(problems))
+
+        log.info("Validacion final: OK")
+        return {
+            **silver_stats,
+            "validation": {
+                "status": "OK",
+                "rows": int(df.shape[0]),
+                "columns": int(df.shape[1]),
+                "genres": int(df["track_genre"].nunique(dropna=True)),
+                "duplicate_track_ids_final": int(duplicate_final or 0),
+                "fully_empty_columns": fully_empty_columns,
+            },
+        }
+
     source = resolve_source_revision()
     bronze = land_bronze(source)
     bronze_stats = inspect_bronze(bronze)
-    build_silver(bronze_stats)
+    silver = build_silver(bronze_stats)
+    validate_silver(silver)
 
 
 genreML_hf_ingest()
-
