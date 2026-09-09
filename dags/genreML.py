@@ -1,38 +1,43 @@
 """
-### GenreML - capa Plata
+### GenreML - Ingesta desde Hugging Face
 
-Construye el CSV de trabajo del proyecto
+Pregunta de investigación:
 
-Pregunta de investigacion:
+> ¿Es posible predecir el género musical de una canción utilizando únicamente
+> sus características de audio?
 
-> Es posible predecir el genero musical de una cancion utilizando unicamente
-> sus caracteristicas de audio?
+Fuente:
+`maharshipandya/spotify-tracks-dataset`
 
-La unidad de analisis es una cancion o track individual. La fuente es el
-dataset publico `maharshipandya/spotify-tracks-dataset` de Hugging Face. El
-DAG arranca desde la API Parquet del Hub:
-`https://huggingface.co/api/datasets/maharshipandya/spotify-tracks-dataset/parquet/default/train`.
+Una fila representa una canción o track.
 
+Columnas utilizadas:
+- `track_id`: identificador único del track; se conserva para trazabilidad y
+  validación, pero no se utiliza como feature del modelo.
+- `duration_ms`, `danceability`, `energy`, `key`, `loudness`, `mode`,
+  `speechiness`, `acousticness`, `instrumentalness`, `liveness`, `valence`,
+  `tempo`, `time_signature`: características de audio.
+- `track_genre`: variable objetivo a predecir.
 
-Validaciones principales:
+El DAG obtiene el dataset desde Hugging Face, conserva una copia cruda en
+Bronce, construye el dataset Plata, valida su calidad y publica el CSV final.
 
-* existencia de `track_id` y `track_genre`;
-* presencia de las caracteristicas de audio esperadas;
-* `track_id` unico en Plata;
-* mas de 1.000 filas;
-* al menos 5 columnas utiles;
-* mezcla de tipos y reporte de `dtypes`;
-* nulos por columna y por feature;
-* ninguna columna completamente vacia;
-* cantidad y distribucion de generos;
-* columnas faltantes o inesperadas respecto del esquema esperado.
-
-
+Tasks:
+- `resolve_source_revision`: identifica la versión actual de la fuente y los
+  archivos Parquet disponibles.
+- `land_bronze`: descarga o reutiliza los Parquet originales en la capa Bronce.
+- `inspect_bronze`: inspecciona el esquema y estadísticas básicas del dato crudo.
+- `build_silver`: selecciona, tipifica y deduplica las columnas utilizadas por
+  GenreML, generando el CSV Plata.
+- `validate_silver`: verifica los criterios de calidad requeridos antes de
+  publicar el dataset.
+- `publish_dataset`: genera la copia final fechada y la versión `latest`.
 """
 from __future__ import annotations
 
 import json
 import logging
+import shutil
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
@@ -560,11 +565,49 @@ def genreML_hf_ingest():
             },
         }
 
+    @task
+    def publish_dataset(validated: dict, **context) -> str:
+        """Publica el CSV validado en una ruta final.
+
+        Entrada: CSV Plata validado.
+        Salida: copia fechada y, si el sistema de archivos lo permite, copia
+        estable `genreML_tracks_latest.csv`.
+        Separacion: solo publica datos que ya pasaron calidad; no transforma ni
+        descarga.
+        """
+        dag_run = context["dag_run"]
+        moment = dag_run.logical_date or dag_run.run_after
+        ds = moment.date().isoformat()
+
+        source = Path(validated["silver_path"])
+        dated_destination = OUTPUT_DIR / f"genreML_tracks_{ds}.csv"
+        latest_destination = OUTPUT_DIR / "genreML_tracks_latest.csv"
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        shutil.copy(source, dated_destination)
+
+        log.info("CSV Plata publicado: %s", dated_destination)
+        try:
+            tmp_latest = latest_destination.with_suffix(".csv.tmp")
+            shutil.copy(source, tmp_latest)
+            tmp_latest.replace(latest_destination)
+            log.info("CSV Plata latest: %s", latest_destination)
+        except PermissionError:
+            log.warning(
+                "No se pudo actualizar %s por permisos o bloqueo del host. "
+                "El CSV fechado ya fue publicado en %s. Si el archivo latest "
+                "esta abierto en Excel, Power BI u otra aplicacion, cerrarlo y "
+                "reintentar esta tarea.",
+                latest_destination,
+                dated_destination,
+            )
+        return str(dated_destination)
+
     source = resolve_source_revision()
     bronze = land_bronze(source)
     bronze_stats = inspect_bronze(bronze)
     silver = build_silver(bronze_stats)
-    validate_silver(silver)
+    validated = validate_silver(silver)
+    publish_dataset(validated)
 
 
 genreML_hf_ingest()
